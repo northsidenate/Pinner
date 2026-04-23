@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Core Drop Mapper</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: sans-serif;
+            background-color: #111;
+        }
+        #ui-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none; /* Lets you click the AR button beneath */
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            z-index: 100;
+        }
+        #status-bar {
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            text-align: center;
+            font-size: 1.2rem;
+            font-weight: bold;
+            transition: background 0.3s;
+        }
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 10px;
+            padding: 15px;
+            pointer-events: auto; /* Re-enable clicks for buttons */
+        }
+        button {
+            padding: 15px 20px;
+            font-size: 1rem;
+            font-weight: bold;
+            border: none;
+            border-radius: 8px;
+            background: #4285F4;
+            color: white;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            cursor: pointer;
+        }
+        button:active {
+            background: #3367D6;
+            transform: translateY(2px);
+        }
+        .action-btn { background: #34A853; }
+        .danger-btn { background: #EA4335; }
+        
+        /* The Three.js AR button will inject itself at the bottom center */
+    </style>
+</head>
+<body>
+
+    <div id="ui-container">
+        <div id="status-bar">Waiting to start AR...</div>
+        <div class="controls" id="controls" style="display: none;">
+            <button onclick="setAnchor()" class="action-btn">Set Anchor (Col)</button>
+            <button onclick="mapCore()">Map Core Here</button>
+            <button onclick="saveCores()">Save Plan</button>
+            <button onclick="loadCores()">Load Plan</button>
+            <button onclick="clearData()" class="danger-btn">Clear All</button>
+        </div>
+    </div>
+
+    <script type="module">
+        import { ARButton } from 'https://unpkg.com/three@0.128.0/examples/jsm/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let anchor = null; 
+        let cores = [];
+        let mode = 'mapping'; // 'mapping' or 'finding'
+        let lastVibe = 0; // Throttle vibration
+        
+        const statusBar = document.getElementById('status-bar');
+        const controls = document.getElementById('controls');
+
+        init();
+        animate();
+
+        function init() {
+            const container = document.createElement('div');
+            document.body.appendChild(container);
+
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true; // Enable WebXR
+            container.appendChild(renderer.domElement);
+
+            // Add the "Start AR" button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            renderer.xr.addEventListener('sessionstart', () => {
+                controls.style.display = 'flex';
+                updateStatus("AR Started. Stand at column and Set Anchor.");
+            });
+
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render() {
+            // Get the phone's current physical position in the world
+            const currentPos = renderer.xr.getCamera(camera).position;
+
+            if (anchor && cores.length > 0) {
+                // We calculate our current X and Z relative to the column (Anchor)
+                const relativeX = currentPos.x - anchor.x;
+                const relativeZ = currentPos.z - anchor.z;
+
+                // Find the closest core using the 2D math distance formula
+                let minDistanceFeet = Infinity;
+
+                for (let i = 0; i < cores.length; i++) {
+                    const dx = cores[i].x - relativeX;
+                    const dz = cores[i].z - relativeZ;
+                    
+                    // Math.hypot calculates the square root of sum of squares
+                    const distMeters = Math.hypot(dx, dz);
+                    const distFeet = distMeters * 3.28084; // Convert meters to feet
+
+                    if (distFeet < minDistanceFeet) {
+                        minDistanceFeet = distFeet;
+                    }
+                }
+
+                // UI and Proximity Logic
+                if (minDistanceFeet <= 1.0) {
+                    statusBar.style.backgroundColor = "#34A853"; // Green
+                    updateStatus(`ON TARGET! (${minDistanceFeet.toFixed(1)} ft)`);
+                    
+                    // Trigger haptic feedback (throttled to once every 2 seconds to avoid crazy buzzing)
+                    const now = Date.now();
+                    if (now - lastVibe > 2000 && navigator.vibrate) {
+                        navigator.vibrate([200, 100, 200]);
+                        lastVibe = now;
+                    }
+                } else if (minDistanceFeet <= 5.0) {
+                    statusBar.style.backgroundColor = "#FBBC05"; // Yellow
+                    updateStatus(`Getting close... (${minDistanceFeet.toFixed(1)} ft)`);
+                } else {
+                    statusBar.style.backgroundColor = "rgba(0, 0, 0, 0.7)"; // Normal black
+                    updateStatus(`Nearest core: ${minDistanceFeet.toFixed(1)} ft away.`);
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // --- BUTTON FUNCTIONS ---
+
+        // We make these global so the HTML buttons can see them
+        window.setAnchor = function() {
+            const currentPos = renderer.xr.getCamera(camera).position;
+            // Record the current physical X and Z coordinates
+            anchor = { x: currentPos.x, z: currentPos.z };
+            updateStatus(`Anchor set! X/Z locked. Proceed to map.`);
+        };
+
+        window.mapCore = function() {
+            if (!anchor) {
+                updateStatus("Please 'Set Anchor' at your column first!");
+                return;
+            }
+            const currentPos = renderer.xr.getCamera(camera).position;
+            // Calculate distance from anchor (ignoring Y axis)
+            const coreX = currentPos.x - anchor.x;
+            const coreZ = currentPos.z - anchor.z;
+            
+            cores.push({ x: coreX, z: coreZ });
+            updateStatus(`Core mapped! Total: ${cores.length}`);
+        };
+
+        window.saveCores = function() {
+            if (cores.length === 0) {
+                updateStatus("No cores to save yet.");
+                return;
+            }
+            localStorage.setItem('jobsite_cores', JSON.stringify(cores));
+            updateStatus("Floor plan saved! You can close the app.");
+        };
+
+        window.loadCores = function() {
+            const savedData = localStorage.getItem('jobsite_cores');
+            if (savedData) {
+                cores = JSON.parse(savedData);
+                anchor = null; // Force them to set a new anchor on the new floor
+                updateStatus(`Loaded ${cores.length} cores. Set Anchor at column to begin finding.`);
+            } else {
+                updateStatus("No saved plan found on this device.");
+            }
+        };
+
+        window.clearData = function() {
+            if(confirm("Are you sure you want to delete all mapped cores?")) {
+                cores = [];
+                anchor = null;
+                localStorage.removeItem('jobsite_cores');
+                statusBar.style.backgroundColor = "rgba(0, 0, 0, 0.7)";
+                updateStatus("Data cleared. Ready to start over.");
+            }
+        };
+
+        function updateStatus(text) {
+            statusBar.innerText = text;
+        }
+    </script>
+</body>
+</html>
